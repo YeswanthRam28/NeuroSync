@@ -1,0 +1,52 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+nsync_env/
+venv/
+env/
+ENV/
+
+# Byte-compiled / optimized / DLL files
+*.so
+*.dylib
+*.pyd
+
+# VS Code
+.vscode/
+
+# Logs
+*.log
+*.csv
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDEs
+.idea/
+*.iml
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# PyInstaller
+dist/
+build/
+*.spec
+
+# Temporary files
+*.tmp
+*.swp
+*.swo
+
+# Media / captured frames (if any large files)
+*.jpg
+*.jpeg
+*.png
+*.mp4
+
+# Virtual environment
+nsync_env/

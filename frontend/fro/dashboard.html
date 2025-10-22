@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NeuroSync Cognitive Focus Dashboard</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Chart.js CDN for data visualization -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+    <!-- Inter Font -->
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #0d1117; color: #c9d1d9; }
+        .card { background-color: #161b22; border: 1px solid #30363d; border-radius: 0.5rem; padding: 1.5rem; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); }
+        .metric-value { font-size: 1.5rem; font-weight: 700; color: #58a6ff; }
+        .metric-label { color: #8b949e; }
+        .header { color: #58a6ff; }
+        .button-primary { background-color: #238636; border-color: #238636; color: white; }
+        .button-stop { background-color: #da3633; border-color: #da3633; color: white; }
+        .button-fetch { background-color: #30363d; color: #c9d1d9; }
+        .status-badge { display: inline-block; padding: 0.25rem 0.75rem; border-radius: 9999px; font-weight: 600; margin-top: 0.5rem; }
+    </style>
+
+    <!-- Firebase SDK Imports -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Global variables provided by the environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let db, auth;
+
+        window.onload = async () => {
+            if (Object.keys(firebaseConfig).length > 0) {
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                window.db = db;
+                window.auth = auth;
+
+                try {
+                    if (initialAuthToken) {
+                        await signInWithCustomToken(auth, initialAuthToken);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                    console.log("Firebase Auth successful. User ID:", auth.currentUser?.uid);
+                    window.userId = auth.currentUser?.uid || crypto.randomUUID();
+                } catch (error) {
+                    console.error("Firebase authentication failed:", error);
+                    window.userId = crypto.randomUUID(); // Fallback
+                }
+            } else {
+                console.warn("Firebase configuration not available. Running in standalone mode.");
+                window.userId = crypto.randomUUID();
+            }
+
+            // Start the main application logic
+            initDashboard();
+        };
+    </script>
+</head>
+
+<body class="p-4 md:p-8 min-h-screen">
+    <h1 class="text-3xl font-bold mb-6 header">🧠 NeuroSync — Cognitive Focus Dashboard</h1>
+
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+        <!-- Main Content Column (2/3 width on large screens) -->
+        <div class="lg:col-span-2 space-y-8">
+            <div class="card">
+                <h2 class="text-2xl font-semibold mb-4 text-blue-400">🎥 Live Camera Feed (Simulated)</h2>
+                <!-- Image slot -->
+                <div id="image-slot" class="w-full h-80 bg-gray-900 flex items-center justify-center rounded-lg overflow-hidden border border-gray-700">
+                    <img id="live-feed-img" src="https://placehold.co/640x480/161b22/c9d1d9?text=Waiting+for+Stream..." alt="Live Camera Feed" class="w-full h-full object-cover">
+                </div>
+                <div id="status-message" class="text-center mt-2 text-sm text-gray-500">Stream Status: Offline</div>
+            </div>
+
+            <div class="card">
+                <h2 class="text-2xl font-semibold mb-4 text-blue-400">📊 Focus Log</h2>
+                <!-- Chart slot -->
+                <div class="w-full h-72">
+                    <canvas id="focusChart"></canvas>
+                </div>
+            </div>
+
+            <!-- Session Summary (Only visible when stream is stopped) -->
+            <div id="session-summary-section" class="card hidden">
+                <h2 class="text-2xl font-semibold mb-4 text-green-400">🧾 Session Summary</h2>
+                <div id="session-summary-content" class="text-lg space-y-2">
+                    <!-- Summary content will be injected here -->
+                </div>
+            </div>
+        </div>
+
+        <!-- Sidebar Column (1/3 width on large screens) -->
+        <div class="lg:col-span-1 space-y-6">
+            <div class="card space-y-4">
+                <h2 class="text-xl font-semibold border-b border-gray-700 pb-2 text-yellow-400">🔍 Realtime Metrics</h2>
+                <div id="realtime-metrics" class="space-y-3">
+                    <div id="focus_text"><span class="metric-label">🧩 Focus:</span> <span class="metric-value">--%</span></div>
+                    <div id="blink_text"><span class="metric-label">👁️ Blinks/min:</span> <span class="metric-value">--</span></div>
+                    <div id="gaze_text"><span class="metric-label">🎯 Gaze (x,y):</span> <span class="metric-value">-- / --</span></div>
+                    <div id="head_text"><span class="metric-label">🤖 Yaw/Pitch:</span> <span class="metric-value">-- / --</span></div>
+                    <div id="status_text" class="text-sm text-gray-400">🕓 Last updated: --</div>
+                </div>
+            </div>
+
+            <div class="card space-y-4">
+                <h2 class="text-xl font-semibold border-b border-gray-700 pb-2 text-green-400">🧠 Cognitive Insights</h2>
+                <div id="cognitive-insights" class="space-y-3">
+                    <div id="stability_text"><span class="metric-label">📊 Focus Stability:</span> <span class="metric-value">-- / 100</span></div>
+                    <div id="drift_text"><span class="metric-label">🚨 Drift Count:</span> <span class="metric-value">0</span> <span id="drift-status" class="status-badge bg-gray-700 text-gray-300">N/A</span></div>
+                    <div id="fatigue_text"><span class="metric-label">💤 Fatigue Level:</span> <span class="metric-value">--</span> <span id="fatigue-status-badge" class="status-badge bg-gray-700 text-gray-300">N/A</span></div>
+                </div>
+            </div>
+
+            <div class="card space-y-4">
+                <h2 class="text-xl font-semibold border-b border-gray-700 pb-2 text-gray-400">⚙️ Controls</h2>
+                <div class="flex flex-col space-y-3">
+                    <button id="run-button" class="button-primary py-2 px-4 rounded-lg font-bold transition duration-150 hover:bg-green-700">🎬 Start / Restart Stream</button>
+                    <button id="stop-button" class="button-stop py-2 px-4 rounded-lg font-bold transition duration-150 hover:bg-red-700">🛑 Stop Stream</button>
+                </div>
+
+                <div class="pt-4 border-t border-gray-700">
+                    <label for="refresh-rate" class="block text-sm font-medium mb-2 text-gray-300">Refresh interval (<span id="rate-value">1.0</span> seconds)</label>
+                    <input type="range" id="refresh-rate" min="0.5" max="5.0" step="0.5" value="1.0" class="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer">
+                </div>
+
+                <button id="fetch-button" class="button-fetch w-full py-2 px-4 rounded-lg font-bold transition duration-150 hover:bg-gray-600">🔄 Fetch Latest Metrics</button>
+            </div>
+
+             <!-- Debug Panel -->
+            <div class="card">
+                <h2 class="text-xl font-semibold border-b border-gray-700 pb-2 text-red-400">Backend & Status (Debug)</h2>
+                <div id="debug-panel" class="text-sm space-y-2 pt-2">
+                    <!-- Debug info injected here -->
+                </div>
+            </div>
+
+        </div>
+    </div>
+
+<script>
+    // ----------------- Config / Safe secrets -----------------
+    const BACKEND_BASE = "http://127.0.0.1:8000"; // Assuming the default local host base
+
+    // ----------------- State Management -----------------
+    let state = {
+        running: false,
+        data_cache: [], // [{timestamp, focus_percent, ...}]
+        drift_count: 0,
+        last_drift_time: null,
+        refresh_interval_ms: 1000,
+        polling_timer: null,
+    };
+
+    let focusChartInstance = null;
+    const MAX_DATA_POINTS = 240; // Max points to display (4 minutes at 1s interval)
+
+    // ----------------- Utility Functions -----------------
+
+    /** Simple exponential backoff retry mechanism for API calls */
+    async function fetchWithRetry(url, options = {}, retries = 3) {
+        let lastError = null;
+        for (let i = 0; i < retries; i++) {
+            try {
+                const response = await fetch(url, options);
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                return response;
+            } catch (error) {
+                lastError = error;
+                // Exponential backoff: 1s, 2s, 4s...
+                const delay = Math.pow(2, i) * 1000;
+                await new Promise(resolve => setTimeout(resolve, delay));
+            }
+        }
+        console.error(`Fetch failed for ${url} after ${retries} attempts:`, lastError);
+        return null;
+    }
+
+    function formatTimestamp(timestamp) {
+        if (!timestamp) return '--';
+        return new Date(timestamp * 1000).toISOString().replace('T', ' ').substring(11, 19);
+    }
+
+    function showToast(message, type = 'success') {
+        // Simple console log replacement for Streamlit's st.toast
+        console.log(`[${type.toUpperCase()}] ${message}`);
+        const statusEl = document.getElementById('status-message');
+        statusEl.textContent = message;
+        statusEl.className = 'text-center mt-2 text-sm ' + (type === 'success' ? 'text-green-500' : type === 'error' ? 'text-red-500' : 'text-yellow-500');
+        setTimeout(() => {
+             if (statusEl.textContent === message) statusEl.textContent = '';
+        }, 5000);
+    }
+
+    // ----------------- Core API & Logic -----------------
+
+    async function startStream() {
+        if (state.running) {
+            stopStream(); // Restart logic
+        }
+        
+        try {
+            const response = await fetchWithRetry(`${BACKEND_BASE}/focus/live`, { method: 'GET', timeout: 3000 });
+            if (response && response.status === 200) {
+                state.running = true;
+                document.getElementById('session-summary-section').classList.add('hidden');
+                document.getElementById('live-feed-img').src = 'https://placehold.co/640x480/161b22/c9d1d9?text=Stream+Starting...';
+                showToast("🎥 Stream started successfully!", 'success');
+                startPolling();
+            } else {
+                showToast(`⚠️ Failed to start stream — status ${response ? response.status : 'N/A'}`, 'error');
+            }
+        } catch (e) {
+            showToast(`❌ Backend not reachable: ${e.message}`, 'error');
+        }
+    }
+
+    function stopStream() {
+        clearInterval(state.polling_timer);
+        state.running = false;
+        showToast("🛑 Stream stopped", 'info');
+        updateDebugPanel();
+        renderSessionSummary(state.data_cache);
+        document.getElementById('session-summary-section').classList.remove('hidden');
+        document.getElementById('live-feed-img').src = 'https://placehold.co/640x480/161b22/c9d1d9?text=Stream+Stopped';
+    }
+
+    function startPolling() {
+        if (state.polling_timer) {
+            clearInterval(state.polling_timer);
+        }
+        // Immediately fetch data on start
+        fetchDataAndRender();
+        // Set up interval for polling
+        state.polling_timer = setInterval(fetchDataAndRender, state.refresh_interval_ms);
+    }
+
+    async function fetchMetrics() {
+        const response = await fetchWithRetry(`${BACKEND_BASE}/focus/metrics`, { timeout: 2500 });
+        if (response) {
+            try {
+                const data = await response.json();
+                if (data.metrics) {
+                    return data.metrics;
+                }
+            } catch (e) {
+                console.error("Error parsing metrics JSON:", e);
+            }
+        }
+        return [];
+    }
+
+    async function fetchSnapshot() {
+        // NOTE: The Python code fetched raw content. In a browser environment, 
+        // we assume the backend returns a base64 string for the image.
+        const response = await fetchWithRetry(`${BACKEND_BASE}/focus/snapshot`, { timeout: 2500 });
+        if (response) {
+            try {
+                const data = await response.json();
+                if (data.image_b64) {
+                    return `data:image/png;base64,${data.image_b64}`;
+                }
+            } catch (e) {
+                console.warn("Error parsing snapshot JSON, defaulting to placeholder.");
+            }
+        }
+        // Placeholder for when backend is down or returns invalid data
+        return 'https://placehold.co/640x480/161b22/c9d1d9?text=No+Live+Feed+Data';
+    }
+
+    // ----------------- Data Processing -----------------
+
+    function computeCognitiveInsights(df) {
+        if (df.length === 0) {
+            return { stability: null, driftDetected: false, fatigueStatus: 'N/A' };
+        }
+
+        const focusVals = df.slice(-30).map(d => d.focus_percent);
+        const blinkVals = df.slice(-30).map(d => d.blink_per_min);
+        const latest = df[df.length - 1];
+        const gaze_x = latest.gaze_x;
+        const gaze_y = latest.gaze_y;
+
+        // --- Focus Stability ---
+        const focusStd = focusVals.length > 1 ? Math.sqrt(focusVals.map(x => Math.pow(x - focusVals.reduce((a, b) => a + b) / focusVals.length, 2)).reduce((a, b) => a + b) / focusVals.length) : 0;
+        const stability = Math.max(0, 100 - focusStd * 2);
+
+        // --- Attention Drift Detection ---
+        let driftDetected = false;
+        if (Math.abs(gaze_x) > 0.3 || Math.abs(gaze_y) > 0.3) {
+            const now = Date.now() / 1000;
+            if (state.last_drift_time === null || now - state.last_drift_time > 5) {
+                state.drift_count += 1;
+                state.last_drift_time = now;
+                driftDetected = true;
+            }
+        }
+
+        // --- Fatigue Prediction ---
+        const focusVar = focusStd * focusStd;
+        const blinkRate = blinkVals.length > 0 ? blinkVals.reduce((a, b) => a + b) / blinkVals.length : 0;
+        const fatigueScore = Math.min(100, (blinkRate * 0.4) + (focusVar * 0.6));
+
+        const fatigueStatus = (
+            fatigueScore < 40 ? "Fresh" : fatigueScore < 70 ? "Mild Fatigue" : "Fatigued"
+        );
+        const fatigueColor = (
+            fatigueScore < 40 ? "bg-green-600" : fatigueScore < 70 ? "bg-yellow-600" : "bg-red-600"
+        );
+
+
+        return { stability, driftDetected, fatigueStatus, fatigueColor };
+    }
+
+    // ----------------- Rendering Functions -----------------
+
+    function updateChart(df) {
+        if (!focusChartInstance) return;
+
+        const labels = df.map(d => formatTimestamp(d.timestamp));
+        const data = df.map(d => d.focus_percent);
+
+        focusChartInstance.data.labels = labels;
+        focusChartInstance.data.datasets[0].data = data;
+        focusChartInstance.update('none'); // 'none' skips animation for smoother real-time update
+    }
+
+    function updateRealtimeMetrics(latest) {
+        document.getElementById('focus_text').querySelector('.metric-value').textContent = `${latest.focus_percent.toFixed(1)}%`;
+        document.getElementById('blink_text').querySelector('.metric-value').textContent = `${latest.blink_per_min.toFixed(1)}`;
+        document.getElementById('gaze_text').querySelector('.metric-value').textContent = `${latest.gaze_x.toFixed(2)} / ${latest.gaze_y.toFixed(2)}`;
+        document.getElementById('head_text').querySelector('.metric-value').textContent = `${latest.yaw.toFixed(1)} / ${latest.pitch.toFixed(1)}`;
+        document.getElementById('status_text').textContent = `🕓 Last updated: ${formatTimestamp(latest.timestamp)}`;
+    }
+
+    function updateCognitiveInsights(stability, driftDetected, fatigueStatus, fatigueColor) {
+        document.getElementById('stability_text').querySelector('.metric-value').textContent = `${stability.toFixed(1)} / 100`;
+
+        document.getElementById('drift_text').querySelector('.metric-value').textContent = state.drift_count;
+        const driftBadge = document.getElementById('drift-status');
+        driftBadge.textContent = driftDetected ? '⚠️ Drift!' : '✅ Stable';
+        driftBadge.className = 'status-badge ' + (driftDetected ? 'bg-red-700 text-white' : 'bg-green-700 text-white');
+
+
+        const fatigueBadge = document.getElementById('fatigue-status-badge');
+        fatigueBadge.textContent = fatigueStatus;
+        fatigueBadge.className = 'status-badge ' + fatigueColor + ' text-white';
+        document.getElementById('fatigue_text').querySelector('.metric-value').textContent = ''; // Clear value for badge
+
+    }
+
+    function renderSessionSummary(df) {
+        const summaryContent = document.getElementById('session-summary-content');
+        if (df.length <= 1) {
+            summaryContent.innerHTML = '<p class="text-lg text-gray-500">No session data yet.</p>';
+            return;
+        }
+
+        const timestamps = df.map(d => d.timestamp);
+        const focusValues = df.map(d => d.focus_percent);
+
+        const duration = timestamps[timestamps.length - 1] - timestamps[0];
+        const avg_focus = focusValues.reduce((a, b) => a + b, 0) / focusValues.length;
+        const max_focus = Math.max(...focusValues);
+        const min_focus = Math.min(...focusValues);
+
+        const verdict = (
+            avg_focus > 80 ? "💪 Great Session! High and sustained focus." :
+            avg_focus > 60 ? "🙂 Decent Focus. Room for improvement on consistency." :
+            "😴 Distracted Session. Try to minimize environmental disruptions."
+        );
+
+        summaryContent.innerHTML = `
+            <p><strong>⏱️ Duration:</strong> ${duration.toFixed(1)} sec</p>
+            <p><strong>📈 Avg Focus:</strong> ${avg_focus.toFixed(1)}%</p>
+            <p><strong>🔺 Max Focus:</strong> ${max_focus.toFixed(1)}%</p>
+            <p><strong>🔻 Min Focus:</strong> ${min_focus.toFixed(1)}%</p>
+            <p><strong>👁️ Drift Count:</strong> ${state.drift_count}</p>
+            <p class="mt-4"><strong>Verdict:</strong> ${verdict}</p>
+        `;
+    }
+
+    function updateDebugPanel() {
+        document.getElementById('debug-panel').innerHTML = `
+            <p>Backend base URL: ${BACKEND_BASE}</p>
+            <p>Streaming running: ${state.running ? '<span class="text-green-500">True</span>' : '<span class="text-red-500">False</span>'}</p>
+            <p>Cached datapoints: ${state.data_cache.length}</p>
+            <p>Drift Count: ${state.drift_count}</p>
+            <p>User ID: ${window.userId ? window.userId.substring(0, 8) + '...' : 'N/A (Auth not ready)'}</p>
+        `;
+    }
+
+    // ----------------- Main Loop -----------------
+
+    async function fetchDataAndRender() {
+        if (!state.running) return;
+
+        // 1. Fetch Metrics
+        const newMetrics = await fetchMetrics();
+
+        if (newMetrics.length > 0) {
+            // Concatenate, sort, and limit data cache
+            state.data_cache = [...state.data_cache, ...newMetrics];
+            
+            // Deduplicate and sort by timestamp
+            const uniqueTimestamps = new Set();
+            state.data_cache = state.data_cache
+                .filter(d => {
+                    if (uniqueTimestamps.has(d.timestamp)) return false;
+                    uniqueTimestamps.add(d.timestamp);
+                    return true;
+                })
+                .sort((a, b) => a.timestamp - b.timestamp)
+                .slice(-MAX_DATA_POINTS);
+            
+            const df = state.data_cache;
+            const latest = df[df.length - 1];
+
+            // 2. Render Chart
+            updateChart(df);
+
+            // 3. Update Realtime Metrics
+            updateRealtimeMetrics(latest);
+
+            // 4. Update Cognitive Insights
+            const { stability, driftDetected, fatigueStatus, fatigueColor } = computeCognitiveInsights(df);
+            if (stability !== null) {
+                updateCognitiveInsights(stability, driftDetected, fatigueStatus, fatigueColor);
+            }
+        }
+
+        // 5. Fetch and Update Snapshot
+        const snapshotUrl = await fetchSnapshot();
+        document.getElementById('live-feed-img').src = snapshotUrl;
+
+        // 6. Update Debug Panel
+        updateDebugPanel();
+    }
+
+
+    // ----------------- Initialization -----------------
+
+    function initChart() {
+        const ctx = document.getElementById('focusChart').getContext('2d');
+        focusChartInstance = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [{
+                    label: 'Focus Percentage',
+                    data: [],
+                    borderColor: '#58a6ff',
+                    backgroundColor: 'rgba(88, 166, 255, 0.2)',
+                    tension: 0.4,
+                    pointRadius: 0,
+                    fill: true,
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    x: {
+                        title: { display: true, text: 'Time', color: '#8b949e' },
+                        ticks: { color: '#8b949e' },
+                        grid: { color: '#30363d' }
+                    },
+                    y: {
+                        title: { display: true, text: 'Focus %', color: '#8b949e' },
+                        min: 0,
+                        max: 100,
+                        ticks: { color: '#8b949e' },
+                        grid: { color: '#30363d' }
+                    }
+                },
+                plugins: {
+                    legend: { display: false },
+                    tooltip: {
+                        backgroundColor: '#161b22',
+                        titleColor: '#c9d1d9',
+                        bodyColor: '#c9d1d9',
+                        borderColor: '#30363d',
+                        borderWidth: 1
+                    }
+                }
+            }
+        });
+    }
+
+    function initDashboard() {
+        initChart();
+        updateDebugPanel(); // Initial debug info
+
+        // Set up Event Listeners
+        document.getElementById('run-button').addEventListener('click', startStream);
+        document.getElementById('stop-button').addEventListener('click', stopStream);
+        document.getElementById('fetch-button').addEventListener('click', fetchDataAndRender);
+
+        const refreshRateSlider = document.getElementById('refresh-rate');
+        const rateValueSpan = document.getElementById('rate-value');
+
+        refreshRateSlider.addEventListener('input', (e) => {
+            const rate = parseFloat(e.target.value);
+            rateValueSpan.textContent = rate.toFixed(1);
+            state.refresh_interval_ms = rate * 1000;
+            if (state.running) {
+                // If running, restart polling with new rate
+                startPolling();
+            }
+        });
+
+        // Initial render of the summary (which shows 'No session data yet' initially)
+        renderSessionSummary(state.data_cache);
+    }
+</script>
+</body>
+</html>
