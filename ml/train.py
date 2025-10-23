@@ -5,7 +5,8 @@ from sklearn.preprocessing import LabelEncoder
 import joblib
 
 # Load CSV (update path)
-df = pd.read_csv("ml_ready_data.csv")
+path = "D:/projects/neurosync/ml/ml_ready_data.csv"
+df = pd.read_csv(path)
 
 # Drop any rows with missing values
 df = df.dropna()
@@ -30,6 +31,6 @@ accuracy = clf.score(X_test, y_test)
 print(f"Test Accuracy: {accuracy*100:.2f}%")
 
 # Save model & label encoder
-joblib.dump(clf, "model.pkl")
-joblib.dump(le, "label_encoder.pkl")
+joblib.dump(clf, "ml/model.pkl")
+joblib.dump(le, "ml/label_encoder.pkl")
 print("✅ Model and label encoder saved in ml/")

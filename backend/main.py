@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware # Import the middleware
 from backend.routes import emotion, focus
@@ -28,16 +27,3 @@ app.include_router(focus.router, prefix="/focus", tags=["Focus Tracking"])
 @app.get("/")
 async def root():
     return {"message": "Welcome to NeuroSync API"}
-=======
-from fastapi import FastAPI
-from backend.routes import emotion, focus
-
-app = FastAPI(title="NeuroSync API", version="1.0")
-
-app.include_router(emotion.router, prefix="/emotion", tags=["Emotion Tracking"])
-app.include_router(focus.router, prefix="/focus", tags=["Focus Tracking"])
-
-@app.get("/")
-async def root():
-    return {"message": "Welcome to NeuroSync API"}
->>>>>>> ccdce86647545da532a9c5a3730488c2e88c7dd7
