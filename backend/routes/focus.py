@@ -18,9 +18,9 @@ SMOOTHING_ALPHA = 0.6
 MICROSLEEP_DURATION = 0.30
 BLINK_MIN_INTERVAL = 0.15
 GAZE_X_THRESHOLD = 0.35
-GAZE_Y_THRESHOLD = 0.35
-HEAD_YAW_LIMIT = 25.0
-HEAD_PITCH_LIMIT = 20.0
+GAZE_Y_THRESHOLD = 0.5
+HEAD_YAW_LIMIT = 35.0
+HEAD_PITCH_LIMIT = 30.0
 LOG_CSV = "focus_log.csv"
 
 WEIGHT_EYE = 0.55
@@ -158,7 +158,7 @@ def generate_focus_feed():
             now = time.time()
 
             if calibrating and now - start_time > CALIBRATION_SECONDS:
-                calibrated_open_ear = np.median(calib_open_ears) if calib_open_ears else 0.28
+                calibrated_open_ear = np.percentile(calib_open_ears,75) if calib_open_ears else 0.28
                 calibrating = False
 
             avg_score, blink_rate, gaze_x, gaze_y, yaw, pitch = 0, 0, 0, 0, 0, 0
@@ -191,7 +191,7 @@ def generate_focus_feed():
                 gaze_x, gaze_y = gaze_normalized(landmarks, w, h)
                 away = abs(gaze_x) > GAZE_X_THRESHOLD or abs(gaze_y) > GAZE_Y_THRESHOLD
                 yaw, pitch, _ = head_pose_angles(landmarks, w, h)
-                phone_flag = pitch > HEAD_PITCH_LIMIT or abs(yaw) > 35
+                phone_flag = (pitch > HEAD_PITCH_LIMIT + 8) and gaze_y > 0.6 or abs(yaw) > 35
 
                 eye_score = np.clip(ear / calibrated_open_ear, 0, 1) if calibrated_open_ear else 0
                 yaw_score = max(0, 1 - abs(yaw) / HEAD_YAW_LIMIT)

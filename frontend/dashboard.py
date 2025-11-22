@@ -18,8 +18,8 @@ st.set_page_config(page_title="🧠 NeuroSync Dashboard", layout="wide")
 st.title("🧠 NeuroSync — Cognitive Focus Dashboard")
 
 # ----------------- Load ML Model (cached) -----------------
-MODEL_PATH = os.path.join("ml", "model.pkl")
-LABEL_PATH = os.path.join("ml", "label_encoder.pkl")
+MODEL_PATH = os.path.join("..", "ml", "model.pkl")
+LABEL_PATH = os.path.join("..", "ml", "label_encoder.pkl")
 
 
 @st.cache_resource
