@@ -7,6 +7,7 @@ import numpy as np
 import joblib
 import os
 import traceback
+import time
 
 # ----------------- Config / Secrets -----------------
 try:
@@ -18,6 +19,7 @@ st.set_page_config(page_title="🧠 NeuroSync Dashboard", layout="wide")
 st.title("🧠 NeuroSync — Cognitive Focus Dashboard")
 
 # ----------------- Load ML Model (cached) -----------------
+# Adjust paths if frontend is in a different folder; this assumes frontend/ is sibling of ml/
 MODEL_PATH = os.path.join("..", "ml", "model.pkl")
 LABEL_PATH = os.path.join("..", "ml", "label_encoder.pkl")
 
@@ -35,7 +37,6 @@ def load_ml_artifacts():
             err = f"Model file not found at {MODEL_PATH}"
         if os.path.exists(LABEL_PATH):
             le = joblib.load(LABEL_PATH)
-        # else label encoder can be None (we'll just show raw labels)
     except Exception as e:
         err = f"Error loading ML artifacts: {e}\n{traceback.format_exc()}"
     return clf, le, err
@@ -73,12 +74,18 @@ with col2:
     fatigue_text = st.empty()
 
     st.markdown("---")
+    # Emotion area sits under cognitive insights (realtime, auto)
+    st.subheader("😊 Emotion (Realtime)")
+    emotion_image_slot = st.empty()
+    emotion_label = st.empty()
+    emotion_details = st.empty()
+
+    st.markdown("---")
     st.write("⚙️ Controls")
     run_button = st.button("🎬 Start / Restart Stream")
     stop_button = st.button("🛑 Stop Stream")
     refresh_rate = st.slider("Refresh interval (seconds)", 0.5, 5.0, 1.0, 0.5)
     fetch_button = st.button("🔄 Fetch Latest Metrics")
-    analyze_button = st.button("😊 Analyze Emotion from Snapshot")
 
 # ----------------- Session State Init -----------------
 if "running" not in st.session_state:
@@ -100,6 +107,8 @@ if "drift_count" not in st.session_state:
     st.session_state["drift_count"] = 0
 if "last_drift_time" not in st.session_state:
     st.session_state["last_drift_time"] = None
+if "last_emotion_time" not in st.session_state:
+    st.session_state["last_emotion_time"] = 0.0
 
 # ----------------- Helper Functions -----------------
 
@@ -114,7 +123,6 @@ def _safe_get_json(r):
 def start_stream():
     """Start stream by verifying backend metrics endpoint and toggling running state."""
     try:
-        # ping /focus/metrics (non-streaming) to verify backend alive
         r = requests.get(f"{BACKEND_BASE}/focus/metrics", timeout=3)
         if r.status_code == 200:
             st.session_state["running"] = True
@@ -162,7 +170,6 @@ def fetch_metrics():
         elif isinstance(j, list):
             data = j
         else:
-            # sometimes backend returns single latest metric dict
             data = [j] if isinstance(j, dict) else []
         if not data:
             return pd.DataFrame()
@@ -228,54 +235,31 @@ def render_session_summary(df):
     st.write(f"**Verdict:** {verdict}")
 
 
-def analyze_emotion():
+def fetch_emotion():
     """
-    Sends a snapshot to a backend emotion analyser.
-    backend expects 'image' file. We send multipart properly with filename and content-type.
+    Sends current snapshot bytes to backend emotion analyser.
+    Backend expects multipart POST with key 'image'.
+    Returns dict (parsed JSON) or None.
     """
     snapshot = fetch_snapshot()
     if not snapshot:
-        st.error("No snapshot available to analyze.")
-        return None
+        return None, "no-snapshot"
 
-    files = {"image": ("snapshot.jpg", snapshot, "image/jpeg")}
+    files = {"file": ("frame.jpg", snapshot, "image/jpeg")}
     try:
-        r = requests.post(f"{BACKEND_BASE}/analyze/emotion", files=files, timeout=5)
-        if r.status_code == 200:
-            # backend could return json or bytes; try json first
-            try:
-                return r.json()
-            except Exception:
-                return r.content
-        else:
-            st.error(f"Emotion analysis failed: {r.status_code}")
+        r = requests.post(f"{BACKEND_BASE}/emotion/analyze", files=files, timeout=6)
     except Exception as e:
-        st.error(f"Emotion analysis error: {e}")
-    return None
+        return None, f"request-error: {e}"
 
+    if r.status_code != 200:
+        return None, f"status-{r.status_code}: {r.text[:200]}"
 
-# ----------------- Button Actions -----------------
-if run_button:
-    start_stream()
-if stop_button:
-    stop_stream()
-if fetch_button:
-    _ = fetch_metrics()  # quick manual poll
-if analyze_button:
-    emo = analyze_emotion()
-    if emo is not None:
-        st.write("Emotion analysis result:")
-        st.json(emo)
-
-
-# ----------------- Auto-Refresh -----------------
-try:
-    from streamlit_autorefresh import st_autorefresh
-    if st.session_state["running"]:
-        st_autorefresh(interval=int(refresh_rate * 1000), key="autorefresh")
-except Exception:
-    if st.session_state["running"]:
-        st.experimental_set_query_params(_refresh=int(datetime.utcnow().timestamp() * 1000) % 1000000)
+    # Try JSON first
+    try:
+        return r.json(), "ok"
+    except Exception:
+        # If backend returns bytes, return raw bytes
+        return {"raw_bytes": True}, "ok"
 
 
 # ----------------- Safe ML prediction helper -----------------
@@ -309,7 +293,6 @@ def safe_ml_predict(latest_row):
     try:
         expected = getattr(clf, "n_features_in_", None)
         if expected is None and hasattr(clf, "steps"):
-            # pipeline case - try last estimator
             last = clf.steps[-1][1]
             expected = getattr(last, "n_features_in_", None)
         if expected is not None and X.shape[1] != expected:
@@ -352,7 +335,26 @@ def safe_ml_predict(latest_row):
         return None, None, "\n".join(debug)
 
 
+# ----------------- Button Actions -----------------
+if run_button:
+    start_stream()
+if stop_button:
+    stop_stream()
+if fetch_button:
+    _ = fetch_metrics()  # quick manual poll
+
+# ----------------- Auto-Refresh -----------------
+try:
+    from streamlit_autorefresh import st_autorefresh
+    if st.session_state["running"]:
+        st_autorefresh(interval=int(refresh_rate * 1000), key="autorefresh")
+except Exception:
+    if st.session_state["running"]:
+        st.experimental_set_query_params(_refresh=int(datetime.utcnow().timestamp() * 1000) % 1000000)
+
 # ----------------- Main Loop -----------------
+EMOTION_POLL_INTERVAL = 2.0  # seconds between emotion requests (throttle)
+
 if st.session_state["running"]:
     df_new = fetch_metrics()
     if not df_new.empty:
@@ -360,9 +362,12 @@ if st.session_state["running"]:
         for col in ["focus_percent", "blink_per_min", "gaze_x", "gaze_y", "yaw", "pitch", "drift_count", "timestamp"]:
             if col not in df_new.columns:
                 df_new[col] = np.nan
-        # coerce numeric
+        # coerce numeric (safely)
         num_cols = ["focus_percent", "blink_per_min", "gaze_x", "gaze_y", "yaw", "pitch", "drift_count"]
-        df_new[num_cols] = df_new[num_cols].astype(float, errors="ignore")
+        for c in num_cols:
+            if c in df_new.columns:
+                df_new[c] = pd.to_numeric(df_new[c], errors="coerce")
+
         st.session_state["data_cache"] = (
             pd.concat([st.session_state["data_cache"], df_new], ignore_index=True)
             .drop_duplicates(subset=["timestamp"], keep="last")
@@ -400,7 +405,6 @@ if st.session_state["running"]:
                             fatigue_text.markdown(f"**💤 Fatigue (Rule vs ML):** {fatigue_status} | {pred_label}")
                     else:
                         fatigue_text.markdown(f"**💤 Fatigue (Rule):** {fatigue_status}")
-                        # debug info visible for troubleshooting
                         st.code(debug_info)
                 else:
                     fatigue_text.markdown(f"**💤 Fatigue Level (Rule):** {fatigue_status}")
@@ -412,11 +416,37 @@ if st.session_state["running"]:
         try:
             image_slot.image(snapshot, width="stretch")
         except Exception:
-            # fallback to placeholder if display fails
             image_slot.image(placeholder_image, width="stretch")
     else:
         image_slot.image(placeholder_image, width="stretch")
 
+    # --- Emotion polling (throttled) ---
+    now_ts = time.time()
+    if now_ts - st.session_state["last_emotion_time"] >= EMOTION_POLL_INTERVAL:
+        st.session_state["last_emotion_time"] = now_ts
+        emo_res, status = fetch_emotion()
+        if emo_res is None:
+            # Show status message; keep previous emotion if exists
+            emotion_label.markdown(f"**Emotion:** `{status}`")
+            emotion_details.text("")  # clear details if failed
+            # show snapshot anyway (if available)
+            if snapshot:
+                emotion_image_slot.image(snapshot, width=200)
+            else:
+                emotion_image_slot.image(placeholder_image, width=200)
+        else:
+            # Expecting JSON like {"emotion": "happy", "scores": {...}} but we accept any dict
+            dominant = emo_res.get("emotion") if isinstance(emo_res, dict) and "emotion" in emo_res else None
+            # try common fields
+            if not dominant and isinstance(emo_res, dict):
+                # attempt to find max score key
+                scores = emo_res.get("scores") or {k: v for k, v in emo_res.items() if isinstance(v, (int, float))}
+                if isinstance(scores, dict) and scores:
+                    dominant = max(scores.items(), key=lambda kv: kv[1])[0]
+            emotion_label.markdown(f"**Emotion:** {dominant if dominant else 'unknown'}")
+            emotion_details.json(emo_res)
+            if snapshot:
+                emotion_image_slot.image(snapshot, width=200)
 else:
     st.markdown("---")
     render_session_summary(st.session_state["data_cache"])
