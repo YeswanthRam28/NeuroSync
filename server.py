@@ -21,7 +21,7 @@ from llm.loader import llm
 # ============================================================
 # FASTAPI INITIALIZATION
 # ============================================================
-app = FastAPI(title="NeuroSync LLM Server — Stable v3")
+app = FastAPI(title="NeuroSync LLM Server — Stable v4")
 
 app.add_middleware(
     CORSMiddleware,
@@ -55,10 +55,7 @@ class MemoryQuery(BaseModel):
 # DASHBOARD PUSH BRIDGE
 # ============================================================
 def push_dashboard(msg: str):
-    """
-    Dashboard listens on: POST /dashboard_event
-    So we forward event-text → dashboard queue.
-    """
+    """Forward event text to dashboard queue."""
     try:
         requests.post(
             "http://127.0.0.1:8501/dashboard_event",
@@ -73,31 +70,27 @@ def push_dashboard(msg: str):
 # HELPERS
 # ============================================================
 def compress_payload(data: Dict[str, Any]):
-    """Compact focus+emotion payloads to avoid context explosion."""
+    """Compact focus/emotion payloads."""
     compact = {}
-
-    # Focus trend
     arr = data.get("focus_trend")
-    if isinstance(arr, list) and len(arr) > 0:
+    if isinstance(arr, list) and arr:
         arr = arr[-120:]
-        avg = sum(arr) / len(arr)
         compact["focus_summary"] = {
-            "avg": avg,
+            "avg": sum(arr) / len(arr),
             "max": max(arr),
             "min": min(arr),
         }
 
-    # Fatigue
     arr2 = data.get("fatigue_curve")
-    if isinstance(arr2, list) and len(arr2) > 0:
+    if isinstance(arr2, list) and arr2:
         arr2 = arr2[-120:]
         compact["fatigue_summary"] = {
             "avg": sum(arr2) / len(arr2),
             "max": max(arr2),
         }
 
-    # direct fields
-    for k in ["focus", "fatigue", "blink", "gaze", "gaze_off", "head_angle", "emotion", "trend", "drifts"]:
+    for k in ["focus", "fatigue", "blink", "gaze", "gaze_off", "head_angle",
+              "emotion", "trend", "drifts"]:
         if k in data:
             compact[k] = data[k]
 
@@ -119,11 +112,7 @@ class WSManager:
 
     def disconnect(self, cid: str):
         with self._lock:
-            if cid in self.clients:
-                try:
-                    del self.clients[cid]
-                except:
-                    pass
+            self.clients.pop(cid, None)
 
     async def send(self, cid: str, text: str):
         with self._lock:
@@ -148,7 +137,7 @@ async def run_blocking(fn, *args, **kwargs):
 
 
 # ============================================================
-# HEALTH
+# HEALTH CHECK
 # ============================================================
 @app.get("/health")
 async def health():
@@ -156,76 +145,108 @@ async def health():
 
 
 # ============================================================
-#  EVENT HANDLER (FINAL)
+# EVENT ENDPOINT
 # ============================================================
 @app.post("/event")
 async def receive_event(payload: EventPayload):
-    """
-    Handles:
-        - focus_drop
-        - distraction
-        - emotion_shift
-    """
-
     event_type = payload.event_type
     client_id = payload.session_id or payload.user_id
     compact = compress_payload(payload.data or {})
 
-    # capture event-loop
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        loop = None  # extremely rare fallback
+        loop = None
 
-    # -----------------------------
-    # Worker thread (NO async inside)
-    # -----------------------------
     def worker():
         try:
-            # Main LLM logic
+            # Actual reasoning
             result = route_event(event_type, compact)
 
-            # Store memory
+            # Memory
             try:
                 add_memory(str(payload.dict()), result)
             except:
                 pass
 
-            # Push to dashboard (HTTP → queue)
+            # Push to dashboard
             push_dashboard(result)
 
-            # If websocket client exists → schedule send
+            # Push to websocket if connected
             if client_id and loop:
-                asyncio.run_coroutine_threadsafe(ws_manager.send(client_id, result), loop)
+                asyncio.run_coroutine_threadsafe(
+                    ws_manager.send(client_id, result),
+                    loop
+                )
 
         except Exception:
             traceback.print_exc()
 
-    # Start thread (non-blocking)
     threading.Thread(target=worker, daemon=True).start()
 
-    return {"status": "queued", "event_type": event_type}
+    return {
+        "status": "queued",
+        "type": "final",
+        "text": f"Event received: {event_type}",
+        "event_type": event_type
+    }
 
 
 # ============================================================
-# CHAT
+# CHAT ENDPOINT (GEMMA FIX APPLIED)
 # ============================================================
-@app.post("/chat")
-async def chat(payload: ChatPayload):
-    prompt = f"User: {payload.message}\nReply briefly."
+def extract_text(out: dict) -> str:
+    """
+    Safe extractor that supports:
+        - Gemma chat_format
+        - Llama text responses
+        - Any fallback format
+    """
+    try:
+        choice = out["choices"][0]
 
-    def sync_call():
-        out = llm(prompt, max_tokens=payload.max_tokens or 200, temperature=0.7)
-        if "choices" in out:
-            c = out["choices"][0]
-            return c.get("text") or c.get("message", {}).get("content", "")
+        # Gemma chat format
+        if "message" in choice and "content" in choice["message"]:
+            return choice["message"]["content"]
+
+        # Llama style
+        if "text" in choice and choice["text"].strip():
+            return choice["text"]
+
+        return str(choice)
+    except:
         return ""
 
-    reply = await run_blocking(sync_call)
-    reply = reply.strip()
 
-    try: add_memory(payload.message, reply)
-    except: pass
+@app.post("/chat")
+async def chat(payload: ChatPayload):
+
+    # Proper Gemma conversation format
+    prompt = (
+        "<start_of_turn>user\n"
+        + payload.message +
+        "\n<end_of_turn>\n"
+        "<start_of_turn>model\n"
+    )
+
+    def sync_call():
+        out = llm(
+            prompt,
+            max_tokens=payload.max_tokens or 200,
+            temperature=0.7
+        )
+        reply = extract_text(out)
+        return reply.strip()
+
+    reply = await run_blocking(sync_call)
+
+    if not reply:
+        reply = "I'm here, but I couldn't generate a reply."
+
+    try:
+        add_memory(payload.message, reply)
+    except:
+        pass
 
     return {"reply": reply}
 
@@ -251,18 +272,20 @@ async def memory_clear():
 
 
 # ============================================================
-# WEBSOCKET
+# WEBSOCKET ENDPOINT
 # ============================================================
 @app.websocket("/ws/{cid}")
 async def ws_endpoint(ws: WebSocket, cid: str):
     await ws_manager.connect(cid, ws)
+
     try:
         while True:
             msg = await ws.receive_text()
             await ws_manager.send(cid, f"pong: {msg}")
+
     except WebSocketDisconnect:
         ws_manager.disconnect(cid)
-    except:
+    except Exception:
         ws_manager.disconnect(cid)
 
 
