@@ -8,25 +8,36 @@ import joblib
 import os
 import traceback
 import time
+import threading
+import queue
+import streamlit.components.v1 as components
 
-# ----------------- Config / Secrets -----------------
-try:
-    BACKEND_BASE = st.secrets["backend_base"]
-except Exception:
-    BACKEND_BASE = "http://127.0.0.1:8000"
+# ======================================================
+# CONFIG
+# ======================================================
+BACKEND_BASE = "http://127.0.0.1:8000"
+LLM_BASE = "http://127.0.0.1:8765"
 
 st.set_page_config(page_title="🧠 NeuroSync Dashboard", layout="wide")
-st.title("🧠 NeuroSync — Cognitive Focus Dashboard")
 
-# ----------------- Load ML Model (cached) -----------------
-# Adjust paths if frontend is in a different folder; this assumes frontend/ is sibling of ml/
+# --------------------------
+# TABS
+# --------------------------
+tabs = st.tabs(["📊 Dashboard", "🤖 Assistant Chat"])
+tab_dashboard, tab_chat = tabs
+
+with tab_dashboard:
+    st.title("🧠 NeuroSync — Cognitive Focus Dashboard")
+
+# ======================================================
+# ML MODEL LOAD
+# ======================================================
 MODEL_PATH = os.path.join("..", "ml", "model.pkl")
 LABEL_PATH = os.path.join("..", "ml", "label_encoder.pkl")
 
 
 @st.cache_resource
 def load_ml_artifacts():
-    """Return (clf, label_encoder, error_str)."""
     clf = None
     le = None
     err = None
@@ -45,140 +56,124 @@ def load_ml_artifacts():
 clf, le, ml_load_err = load_ml_artifacts()
 ml_ready = clf is not None
 
-if not ml_ready:
-    st.warning("ML model not loaded." + (f" Details: {ml_load_err}" if ml_load_err else ""))
 
-# ----------------- UI Layout -----------------
-col1, col2 = st.columns([2, 1])
+# ======================================================
+# SESSION STATE INIT
+# ======================================================
+defaults = {
+    "running": False,
+    "data_cache": pd.DataFrame(columns=[
+        "timestamp", "focus_percent", "blink_per_min", "gaze_x", "gaze_y", "yaw", "pitch", "drift_count"
+    ]),
+    "drift_count": 0,
+    "last_drift_time": None,
+    "last_emotion_time": 0.0,
+    "prev_emotion": None,
+    "llm_messages": [],
+    "last_llm_event": {},
+    "llm_queue": None,
+}
 
-with col1:
-    st.subheader("🎥 Live Camera Feed")
-    placeholder_image = np.zeros((480, 640, 3), dtype=np.uint8)
-    image_slot = st.image(placeholder_image, width="stretch")
-
-    st.subheader("📊 Focus Log")
-    chart = st.empty()
-
-with col2:
-    st.subheader("🔍 Realtime Metrics")
-    focus_text = st.empty()
-    blink_text = st.empty()
-    gaze_text = st.empty()
-    head_text = st.empty()
-    status_text = st.empty()
-
-    st.markdown("---")
-    st.subheader("🧠 Cognitive Insights")
-    stability_text = st.empty()
-    drift_text = st.empty()
-    fatigue_text = st.empty()
-
-    st.markdown("---")
-    # Emotion area sits under cognitive insights (realtime, auto)
-    st.subheader("😊 Emotion (Realtime)")
-    emotion_image_slot = st.empty()
-    emotion_label = st.empty()
-    emotion_details = st.empty()
-
-    st.markdown("---")
-    st.write("⚙️ Controls")
-    run_button = st.button("🎬 Start / Restart Stream")
-    stop_button = st.button("🛑 Stop Stream")
-    refresh_rate = st.slider("Refresh interval (seconds)", 0.5, 5.0, 1.0, 0.5)
-    fetch_button = st.button("🔄 Fetch Latest Metrics")
-
-# ----------------- Session State Init -----------------
-if "running" not in st.session_state:
-    st.session_state["running"] = False
-if "data_cache" not in st.session_state:
-    st.session_state["data_cache"] = pd.DataFrame(
-        columns=[
-            "timestamp",
-            "focus_percent",
-            "blink_per_min",
-            "gaze_x",
-            "gaze_y",
-            "yaw",
-            "pitch",
-            "drift_count",
-        ]
-    )
-if "drift_count" not in st.session_state:
-    st.session_state["drift_count"] = 0
-if "last_drift_time" not in st.session_state:
-    st.session_state["last_drift_time"] = None
-if "last_emotion_time" not in st.session_state:
-    st.session_state["last_emotion_time"] = 0.0
-
-# ----------------- Helper Functions -----------------
+for k, v in defaults.items():
+    if k not in st.session_state:
+        if k == "llm_queue":
+            st.session_state["llm_queue"] = queue.Queue()
+        else:
+            st.session_state[k] = v
 
 
+# ======================================================
+# UTILITY HELPERS
+# ======================================================
 def _safe_get_json(r):
     try:
         return r.json()
-    except Exception:
+    except:
         return None
 
 
+def compress_payload(data):
+    compact = {}
+    arr = data.get("focus_trend")
+    if isinstance(arr, (list, tuple)) and arr:
+        arr = list(map(float, arr[-120:]))
+        compact["focus_summary"] = {
+            "avg": float(np.mean(arr)),
+            "max": float(np.max(arr)),
+            "min": float(np.min(arr)),
+            "sd": float(np.std(arr)),
+        }
+
+    arr2 = data.get("fatigue_curve")
+    if isinstance(arr2, (list, tuple)) and arr2:
+        arr2 = list(map(float, arr2[-120:]))
+        compact["fatigue_summary"] = {
+            "avg": float(np.mean(arr2)),
+            "max": float(np.max(arr2)),
+        }
+
+    for k in ["focus", "fatigue", "blink", "gaze", "emotion", "trend", "drifts", "gaze_off", "head_angle"]:
+        if k in data:
+            compact[k] = data[k]
+
+    return compact
+
+
+# ======================================================
+# BACKEND INTERACTIONS
+# ======================================================
 def start_stream():
-    """Start stream by verifying backend metrics endpoint and toggling running state."""
     try:
         r = requests.get(f"{BACKEND_BASE}/focus/metrics", timeout=3)
         if r.status_code == 200:
             st.session_state["running"] = True
-            st.toast("🎥 Stream started successfully!", icon="✅")
+            st.info("🎥 Stream started!")
         else:
-            st.error(f"⚠️ Failed to start stream — status {r.status_code}")
+            st.error("Cannot reach backend.")
     except Exception as e:
-        st.error(f"❌ Backend not reachable: {e}")
+        st.error(f"Backend unreachable: {e}")
 
 
 def stop_stream():
     st.session_state["running"] = False
-    st.toast("🛑 Stream stopped", icon="🧩")
+    st.info("🛑 Stream stopped")
 
 
 def fetch_snapshot():
-    """
-    Fetch snapshot bytes from backend.
-    Backend expected to return raw jpeg bytes (content-type image/jpeg).
-    """
     try:
         r = requests.get(f"{BACKEND_BASE}/focus/snapshot", timeout=3)
-        if r.status_code == 200 and r.content:
-            return r.content
-    except Exception:
-        pass
-    return None
+        return r.content if r.status_code == 200 else None
+    except:
+        return None
 
 
 def fetch_metrics():
-    """
-    Fetch metrics. Backend may return either:
-      - {"metrics": [ ... ] } or
-      - [ ... ]
-    We return a DataFrame (possibly empty).
-    """
     try:
         r = requests.get(f"{BACKEND_BASE}/focus/metrics", timeout=3)
         r.raise_for_status()
         j = _safe_get_json(r)
-        if j is None:
-            return pd.DataFrame()
         if isinstance(j, dict) and "metrics" in j:
-            data = j.get("metrics", [])
-        elif isinstance(j, list):
-            data = j
-        else:
-            data = [j] if isinstance(j, dict) else []
-        if not data:
-            return pd.DataFrame()
-        df = pd.DataFrame(data)
-        return df
-    except Exception:
+            j = j["metrics"]
+        return pd.DataFrame(j) if isinstance(j, list) else pd.DataFrame()
+    except:
         return pd.DataFrame()
 
 
+def fetch_emotion():
+    snapshot = fetch_snapshot()
+    if not snapshot:
+        return None
+    files = {"file": ("frame.jpg", snapshot, "image/jpeg")}
+    try:
+        r = requests.post(f"{BACKEND_BASE}/emotion/analyze", files=files, timeout=5)
+        return r.json() if r.status_code == 200 else None
+    except:
+        return None
+
+
+# ======================================================
+# INSIGHTS
+# ======================================================
 def compute_cognitive_insights(df):
     if df.empty:
         return None, None, None
@@ -189,19 +184,16 @@ def compute_cognitive_insights(df):
     gaze_y = float(df["gaze_y"].iloc[-1])
 
     stability = max(0, 100 - np.std(focus_vals) * 2)
-    drift_detected = False
 
+    drift_detected = False
     if abs(gaze_x) > 0.3 or abs(gaze_y) > 0.3:
-        now = datetime.now().timestamp()
-        if st.session_state["last_drift_time"] is None or now - st.session_state["last_drift_time"] > 5:
+        now = time.time()
+        if not st.session_state["last_drift_time"] or now - st.session_state["last_drift_time"] > 5:
             st.session_state["drift_count"] += 1
             st.session_state["last_drift_time"] = now
             drift_detected = True
 
-    focus_var = float(np.var(focus_vals))
-    blink_rate = float(np.mean(blink_vals)) if len(blink_vals) > 0 else 0.0
-    fatigue_score = min(100, (blink_rate * 0.4) + (focus_var * 0.6))
-
+    fatigue_score = min(100, (np.mean(blink_vals) * 0.4) + (np.var(focus_vals) * 0.6))
     fatigue_status = (
         "🟢 Fresh" if fatigue_score < 40 else
         "🟡 Mild Fatigue" if fatigue_score < 70 else
@@ -211,253 +203,506 @@ def compute_cognitive_insights(df):
     return stability, drift_detected, fatigue_status
 
 
-def render_session_summary(df):
-    if df.empty:
-        st.info("No session data yet.")
+# ======================================================
+# LLM WORKERS
+# ======================================================
+def _enqueue_llm_message(msg):
+    try:
+        st.session_state["llm_queue"].put_nowait(msg)
+    except:
+        st.session_state["llm_queue"] = queue.Queue()
+        st.session_state["llm_queue"].put_nowait(msg)
+
+
+def send_llm_event(event_type, data):
+    now = time.time()
+    last = st.session_state["last_llm_event"].get(event_type, 0)
+    if now - last < 10:
         return
+    st.session_state["last_llm_event"][event_type] = now
 
-    st.markdown("## 🧾 Session Summary")
-    duration = (df["timestamp"].iloc[-1] - df["timestamp"].iloc[0]) if len(df) > 1 else 0
-    avg_focus = df["focus_percent"].mean()
-    max_focus = df["focus_percent"].max()
-    min_focus = df["focus_percent"].min()
+    payload = {"event_type": event_type, "data": compress_payload(data)}
 
-    st.write(f"**⏱️ Duration:** {duration:.1f} sec")
-    st.write(f"**📈 Avg Focus:** {avg_focus:.1f}%")
-    st.write(f"**🔺 Max Focus:** {max_focus:.1f}%")
-    st.write(f"**🔻 Min Focus:** {min_focus:.1f}%")
-    st.write(f"**👁️ Drift Count:** {st.session_state['drift_count']}")
-    verdict = (
-        "💪 Great Session!" if avg_focus > 80 else
-        "🙂 Decent Focus" if avg_focus > 60 else
-        "😴 Distracted Session"
-    )
-    st.write(f"**Verdict:** {verdict}")
-
-
-def fetch_emotion():
-    """
-    Sends current snapshot bytes to backend emotion analyser.
-    Backend expects multipart POST with key 'image'.
-    Returns dict (parsed JSON) or None.
-    """
-    snapshot = fetch_snapshot()
-    if not snapshot:
-        return None, "no-snapshot"
-
-    files = {"file": ("frame.jpg", snapshot, "image/jpeg")}
-    try:
-        r = requests.post(f"{BACKEND_BASE}/emotion/analyze", files=files, timeout=6)
-    except Exception as e:
-        return None, f"request-error: {e}"
-
-    if r.status_code != 200:
-        return None, f"status-{r.status_code}: {r.text[:200]}"
-
-    # Try JSON first
-    try:
-        return r.json(), "ok"
-    except Exception:
-        # If backend returns bytes, return raw bytes
-        return {"raw_bytes": True}, "ok"
-
-
-# ----------------- Safe ML prediction helper -----------------
-def safe_ml_predict(latest_row):
-    """
-    latest_row: pandas Series or dict containing feature values.
-    Returns (pred_label, prob, debug_str)
-    """
-    if not ml_ready or clf is None:
-        return None, None, "ML not available"
-
-    # define expected feature order (must match training)
-    feature_names = ["focus_percent", "blink_per_min", "gaze_x", "gaze_y", "yaw", "pitch", "drift_count"]
-    vals = []
-    debug = []
-    for f in feature_names:
+    def _worker():
         try:
-            v = latest_row.get(f) if hasattr(latest_row, "get") else latest_row[f]
-        except Exception:
-            try:
-                v = float(latest_row[f])
-            except Exception:
-                v = None
-        if v is None or (isinstance(v, float) and np.isnan(v)):
-            debug.append(f"feature {f} missing/NaN -> filling 0.0")
-            v = 0.0
-        vals.append(float(v))
-    X = np.array(vals, dtype=float).reshape(1, -1)
+            r = requests.post(f"{LLM_BASE}/event", json=payload, timeout=8)
+            j = _safe_get_json(r) or {}
+            msg = j.get("summary") or j.get("result") or j.get("status") or str(j)
+            _enqueue_llm_message(msg)
+        except Exception as e:
+            _enqueue_llm_message(f"Error: {e}")
 
-    # check n_features_in_ if available for warning
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def llm_chat_async(message):
+    payload = {"message": message}
+
+    def _worker():
+        try:
+            r = requests.post(f"{LLM_BASE}/chat", json=payload, timeout=15)
+            j = _safe_get_json(r) or {}
+            reply = j.get("reply") or str(j)
+            _enqueue_llm_message(reply)
+        except Exception as e:
+            _enqueue_llm_message(f"Error: {e}")
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+# ============================================================================================
+# TAB 1 — DASHBOARD VIEW
+# ============================================================================================
+with tab_dashboard:
+
+    col1, col2 = st.columns([2, 1])
+
+    with col1:
+        st.subheader("🎥 Live Camera Feed")
+        placeholder_image = np.zeros((480, 640, 3), np.uint8)
+        image_slot = st.image(placeholder_image, use_container_width=True)
+
+        st.subheader("📊 Focus Log")
+        chart = st.empty()
+
+    with col2:
+        st.subheader("🔍 Realtime Metrics")
+        focus_text = st.empty()
+        blink_text = st.empty()
+        gaze_text = st.empty()
+        head_text = st.empty()
+        status_text = st.empty()
+        st.markdown("---")
+
+        st.subheader("🧠 Cognitive Insights")
+        stability_text = st.empty()
+        drift_text = st.empty()
+        fatigue_text = st.empty()
+        st.markdown("---")
+
+        st.subheader("🧠 Assistant Events")
+        llm_msg_slot = st.empty()
+        st.markdown("---")
+
+        run_button = st.button("🎬 Start / Restart Stream")
+        stop_button = st.button("🛑 Stop Stream")
+        refresh_rate = st.slider("Refresh interval", 0.5, 5.0, 1.0, 0.5)
+
+    if run_button:
+        start_stream()
+    if stop_button:
+        stop_stream()
+
+    # Auto-refresh
     try:
-        expected = getattr(clf, "n_features_in_", None)
-        if expected is None and hasattr(clf, "steps"):
-            last = clf.steps[-1][1]
-            expected = getattr(last, "n_features_in_", None)
-        if expected is not None and X.shape[1] != expected:
-            debug.append(f"WARNING: X.shape={X.shape}, model expects {expected}")
-    except Exception as e:
-        debug.append(f"n_features_in_ check error: {e}")
+        from streamlit_autorefresh import st_autorefresh
+        if st.session_state["running"]:
+            st_autorefresh(interval=int(refresh_rate * 1000), key="autorefresh2")
+    except:
+        pass
 
-    # predict
-    try:
-        if hasattr(clf, "predict_proba"):
-            probs = clf.predict_proba(X)
-            idx = int(np.argmax(probs, axis=1)[0])
-            prob_val = float(np.max(probs, axis=1)[0])
-            classes = getattr(clf, "classes_", None)
-            pred_raw = classes[idx] if classes is not None else idx
-            if le is not None:
-                try:
-                    pred_label = le.inverse_transform([pred_raw])[0]
-                except Exception:
-                    pred_label = str(pred_raw)
-            else:
-                pred_label = str(pred_raw)
-            debug.append(f"predict_proba ok, prob={prob_val:.3f}")
-            return pred_label, prob_val, "\n".join(debug)
-        else:
-            pred = clf.predict(X)
-            pred0 = pred[0]
-            if le is not None:
-                try:
-                    pred_label = le.inverse_transform([pred0])[0]
-                except Exception:
-                    pred_label = str(pred0)
-            else:
-                pred_label = str(pred0)
-            debug.append("predict() ok")
-            return pred_label, None, "\n".join(debug)
-    except Exception as e:
-        debug.append("Prediction error: " + str(e))
-        debug.append(traceback.format_exc())
-        return None, None, "\n".join(debug)
-
-
-# ----------------- Button Actions -----------------
-if run_button:
-    start_stream()
-if stop_button:
-    stop_stream()
-if fetch_button:
-    _ = fetch_metrics()  # quick manual poll
-
-# ----------------- Auto-Refresh -----------------
-try:
-    from streamlit_autorefresh import st_autorefresh
+    # ======================================================
+    # MAIN LOOP
+    # ======================================================
     if st.session_state["running"]:
-        st_autorefresh(interval=int(refresh_rate * 1000), key="autorefresh")
-except Exception:
-    if st.session_state["running"]:
-        st.experimental_set_query_params(_refresh=int(datetime.utcnow().timestamp() * 1000) % 1000000)
-
-# ----------------- Main Loop -----------------
-EMOTION_POLL_INTERVAL = 2.0  # seconds between emotion requests (throttle)
-
-if st.session_state["running"]:
-    df_new = fetch_metrics()
-    if not df_new.empty:
-        # ensure expected numeric columns exist and coerce types
-        for col in ["focus_percent", "blink_per_min", "gaze_x", "gaze_y", "yaw", "pitch", "drift_count", "timestamp"]:
-            if col not in df_new.columns:
-                df_new[col] = np.nan
-        # coerce numeric (safely)
-        num_cols = ["focus_percent", "blink_per_min", "gaze_x", "gaze_y", "yaw", "pitch", "drift_count"]
-        for c in num_cols:
-            if c in df_new.columns:
-                df_new[c] = pd.to_numeric(df_new[c], errors="coerce")
-
-        st.session_state["data_cache"] = (
-            pd.concat([st.session_state["data_cache"], df_new], ignore_index=True)
-            .drop_duplicates(subset=["timestamp"], keep="last")
-            .reset_index(drop=True)
-        )
-        df = st.session_state["data_cache"].copy()
-
-        if "timestamp" in df.columns and not df.empty:
-            # convert timestamp -> ts and sort
-            df["ts"] = df["timestamp"].apply(lambda t: datetime.fromtimestamp(float(t)))
-            df = df.sort_values("ts").tail(240)
-            chart.line_chart(df.set_index("ts")["focus_percent"])
-
-            latest = df.iloc[-1]
-            focus_text.markdown(f"**🧩 Focus:** {float(latest['focus_percent']):.1f}%")
-            blink_text.markdown(f"**👁️ Blinks/min:** {float(latest['blink_per_min']):.1f}")
-            gaze_text.markdown(f"**🎯 Gaze (x,y):** {float(latest['gaze_x']):.2f}, {float(latest['gaze_y']):.2f}")
-            head_text.markdown(f"**🤖 Yaw/Pitch:** {float(latest['yaw']):.1f}, {float(latest['pitch']):.1f}")
-            status_text.markdown(f"**🕓 Last updated:** {df['ts'].iloc[-1].isoformat()}")
-
-            # --- Cognitive Insights ---
-            stability, drift_detected, fatigue_status = compute_cognitive_insights(df)
-            if stability is not None:
-                stability_text.markdown(f"**📊 Focus Stability:** {stability:.1f} / 100")
-                drift_text.markdown(
-                    f"**🚨 Drift Count:** {st.session_state['drift_count']} ({'⚠️ Drift!' if drift_detected else '✅ Stable'})"
-                )
-                # ML prediction (safe)
-                if ml_ready:
-                    pred_label, prob, debug_info = safe_ml_predict(latest)
-                    if pred_label:
-                        if prob is not None:
-                            fatigue_text.markdown(f"**💤 Fatigue (Rule vs ML):** {fatigue_status} | {pred_label} ({prob*100:.1f}%)")
-                        else:
-                            fatigue_text.markdown(f"**💤 Fatigue (Rule vs ML):** {fatigue_status} | {pred_label}")
-                    else:
-                        fatigue_text.markdown(f"**💤 Fatigue (Rule):** {fatigue_status}")
-                        st.code(debug_info)
+        df_new = fetch_metrics()
+        if not df_new.empty:
+            for col in [
+                "focus_percent", "blink_per_min",
+                "gaze_x", "gaze_y", "yaw", "pitch",
+                "drift_count", "timestamp"
+            ]:
+                if col not in df_new:
+                    df_new[col] = np.nan
                 else:
-                    fatigue_text.markdown(f"**💤 Fatigue Level (Rule):** {fatigue_status}")
+                    df_new[col] = pd.to_numeric(df_new[col], errors="coerce")
 
-    # snapshot display
-    snapshot = fetch_snapshot()
-    if snapshot:
-        # pass raw bytes to st.image (Streamlit will detect image)
+            st.session_state["data_cache"] = (
+                pd.concat([st.session_state["data_cache"], df_new], ignore_index=True)
+                .drop_duplicates(subset=["timestamp"], keep="last")
+                .reset_index(drop=True)
+            )
+            df = st.session_state["data_cache"].tail(240)
+
+            if not df.empty:
+                df["ts"] = df["timestamp"].apply(lambda t: datetime.fromtimestamp(float(t)))
+                chart.line_chart(df.set_index("ts")["focus_percent"], use_container_width=True)
+
+                latest = df.iloc[-1]
+                focus_text.markdown(f"**🧩 Focus:** {float(latest['focus_percent']):.1f}%")
+                blink_text.markdown(f"**👁️ Blinks/min:** {float(latest['blink_per_min']):.1f}")
+                gaze_text.markdown(f"**🎯 Gaze:** {float(latest['gaze_x']):.2f}, {float(latest['gaze_y']):.2f}")
+                head_text.markdown(f"**🤖 Yaw/Pitch:** {float(latest['yaw']):.1f}, {float(latest['pitch']):.1f}")
+                status_text.markdown(f"Updated: {df['ts'].iloc[-1].strftime('%H:%M:%S')}")
+
+                stability, drift_detected, fatigue_status = compute_cognitive_insights(df)
+                stability_text.markdown(f"**📊 Stability:** {stability:.1f}")
+                drift_text.markdown(f"**🚨 Drift Count:** {st.session_state['drift_count']}")
+                fatigue_text.markdown(f"**💤 Fatigue:** {fatigue_status}")
+
+                # Trigger LLM
+                try:
+                    avg_recent = float(df["focus_percent"].tail(30).mean())
+                    if float(latest["focus_percent"]) < max(50, avg_recent - 18):
+                        send_llm_event("focus_drop", {
+                            "focus": float(latest["focus_percent"]),
+                            "fatigue": fatigue_status,
+                            "blink": float(latest["blink_per_min"]),
+                        })
+
+                    if drift_detected:
+                        send_llm_event("distraction", {
+                            "gaze_off": 5,
+                            "head_angle": float(latest["yaw"])
+                        })
+                except:
+                    pass
+
+        # show camera
+        snapshot = fetch_snapshot()
+        if snapshot:
+            image_slot.image(snapshot, use_container_width=True)
+
+        # EMOTION
+        now_ts = time.time()
+        if now_ts - st.session_state["last_emotion_time"] > 2:
+            st.session_state["last_emotion_time"] = now_ts
+            emo = fetch_emotion()
+            if emo:
+                dominant = emo.get("emotion", "unknown")
+                if dominant != st.session_state["prev_emotion"]:
+                    st.session_state["prev_emotion"] = dominant
+                    send_llm_event("emotion_shift", {"emotion": dominant})
+
+
+    # ======================================================
+    # PROCESS LLM QUEUE (FIXED — filters chunk/tokens properly)
+    # ======================================================
+    try:
+        q = st.session_state["llm_queue"]
+        drained = []
+
+        # Pull up to 16 tokens per refresh
+        while not q.empty() and len(drained) < 16:
+            drained.append(q.get_nowait())
+
+        for tok in drained:
+
+            # Skip accidental non-dict messages
+            if not isinstance(tok, dict):
+                continue
+
+            t = tok.get("type")
+
+            # -----------------------------
+            # START TYPING
+            # -----------------------------
+            if t == "typing_start":
+                st.session_state["typing"] = True
+
+            # -----------------------------
+            # STOP TYPING
+            # -----------------------------
+            elif t == "typing_end":
+                st.session_state["typing"] = False
+                st.session_state["current_stream"] = ""
+
+            # -----------------------------
+            # STREAMING CHUNK UPDATE
+            # -----------------------------
+            elif t == "chunk":
+                # Show partial response (live text)
+                st.session_state["current_stream"] = tok.get("text", "")
+
+            # -----------------------------
+            # FINAL RESPONSE
+            # -----------------------------
+            elif t == "final":
+                final_text = tok.get("text", "").strip()
+
+                # Clear streaming state
+                st.session_state["current_stream"] = ""
+                st.session_state["typing"] = False
+
+                # Append ONLY the final assistant message
+                st.session_state["llm_messages"].append({
+                    "ts": datetime.utcnow().strftime("%H:%M:%S"),
+                    "text": final_text,
+                    "source": "LLM"
+                })
+
+    except Exception:
+        st.session_state["llm_queue"] = queue.Queue()
+
+
+
+# ============================================================================================
+# TAB 2 — CHAT INTERFACE (thread-safe streaming, fixed)
+# ============================================================================================
+with tab_chat:
+    st.title("🤖 NeuroSync Assistant")
+
+    # -------------------------
+    # Controls column
+    # -------------------------
+    ctrl_col, chat_col = st.columns([2, 8])
+    with ctrl_col:
+        st.markdown("### Controls")
+        local_memory_mode = st.checkbox(
+            "Keep history local (client-side only)",
+            value=False,
+            help="When checked, assistant replies are also stored in local browser session memory."
+        )
+
+        if st.button("Clear server memory"):
+            try:
+                r = requests.post(f"{LLM_BASE}/memory/clear", timeout=6)
+                if r.status_code == 200:
+                    st.success("Server memory cleared.")
+                else:
+                    st.error(f"Server responded: {r.status_code}")
+            except Exception as e:
+                st.error(f"Error clearing server memory: {e}")
+
+        if st.button("Export local chat"):
+            export = {"chat": st.session_state.get("llm_messages", [])}
+            st.download_button(
+                "Download JSON",
+                data=str(export),
+                file_name="neurosync_chat.json",
+                mime="application/json"
+            )
+
+    # -------------------------
+    # Ensure session state keys exist (main thread only)
+    # -------------------------
+    if "llm_messages" not in st.session_state:
+        st.session_state["llm_messages"] = []  # list of {"ts","text","source"}
+
+    if "llm_queue" not in st.session_state or st.session_state["llm_queue"] is None:
+        st.session_state["llm_queue"] = queue.Queue()
+
+    if "typing" not in st.session_state:
+        st.session_state["typing"] = False
+
+    if "current_stream" not in st.session_state:
+        st.session_state["current_stream"] = ""
+
+    if "chat_input_value" not in st.session_state:
+        st.session_state["chat_input_value"] = ""
+
+    # flag used to clear the input safely on next rerun
+    if "chat_clear_flag" not in st.session_state:
+        st.session_state["chat_clear_flag"] = False
+
+    # local reference to avoid repeated session_state access inside loops
+    local_queue = st.session_state["llm_queue"]
+
+    # -------------------------
+    # safe_json helper
+    # -------------------------
+    def safe_json(resp):
         try:
-            image_slot.image(snapshot, width="stretch")
+            return resp.json()
         except Exception:
-            image_slot.image(placeholder_image, width="stretch")
-    else:
-        image_slot.image(placeholder_image, width="stretch")
+            return {}
 
-    # --- Emotion polling (throttled) ---
-    now_ts = time.time()
-    if now_ts - st.session_state["last_emotion_time"] >= EMOTION_POLL_INTERVAL:
-        st.session_state["last_emotion_time"] = now_ts
-        emo_res, status = fetch_emotion()
-        if emo_res is None:
-            # Show status message; keep previous emotion if exists
-            emotion_label.markdown(f"**Emotion:** `{status}`")
-            emotion_details.text("")  # clear details if failed
-            # show snapshot anyway (if available)
-            if snapshot:
-                emotion_image_slot.image(snapshot, width=200)
+    # -------------------------
+    # styling
+    # -------------------------
+    st.markdown(
+        """
+        <style>
+        .chat-box { background:#0b1220; color:#e6eef9; padding:12px; border-radius:10px;
+                   max-height:520px; overflow:auto; }
+        .msg-row { display:flex; margin-bottom:10px; align-items:flex-end; }
+        .msg-user { margin-left:auto; background:#dbeafe; color:#061122; padding:10px 14px;
+                   border-radius:14px; max-width:72%; word-wrap:break-word; }
+        .msg-assistant { margin-right:auto; background:#0f1724; color:#e6eef9; padding:10px 14px;
+                         border-radius:14px; max-width:72%; word-wrap:break-word; border:1px solid rgba(255,255,255,0.04);}
+        .avatar { width:36px; height:36px; border-radius:50%; margin-right:8px; }
+        .typing { opacity:0.85; font-style:italic; color:#9fb3d7; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # -------------------------
+    # Drain queue (MAIN THREAD only)
+    # -------------------------
+    try:
+        drained = []
+        q = local_queue
+        # limit how many tokens we process each tick
+        while not q.empty() and len(drained) < 16:
+            drained.append(q.get_nowait())
+
+        for tok in drained:
+            # ignore accidental non-dict values (defensive)
+            if not isinstance(tok, dict):
+                continue
+
+            tok_type = tok.get("type")
+            if tok_type == "typing_start":
+                st.session_state["typing"] = True
+
+            elif tok_type == "typing_end":
+                st.session_state["typing"] = False
+                st.session_state["current_stream"] = ""
+
+            elif tok_type == "chunk":
+                # display the streaming partial (do NOT append to history)
+                st.session_state["current_stream"] = tok.get("text", "")
+
+            elif tok_type == "final":
+                # final assistant text -> add to chat history only here
+                final_text = tok.get("text", "")
+                st.session_state["current_stream"] = ""
+                st.session_state["llm_messages"].append({
+                    "ts": datetime.utcnow().strftime("%H:%M:%S"),
+                    "text": final_text,
+                    "source": "LLM"
+                })
+                if local_memory_mode:
+                    st.session_state.setdefault("chat_memory", []).append({
+                        "role": "assistant",
+                        "text": final_text,
+                        "ts": datetime.utcnow().isoformat()
+                    })
+    except Exception:
+        # recover queue if broken
+        st.session_state["llm_queue"] = queue.Queue()
+        local_queue = st.session_state["llm_queue"]
+
+    # -------------------------
+    # Render chat HTML (history + streaming + typing)
+    # -------------------------
+    def build_chat_html(messages, streaming_text, typing_flag):
+        html = "<div class='chat-box'>"
+        for m in messages[-80:]:
+            if m.get("source") == "USER":
+                html += (
+                    "<div class='msg-row' style='justify-content:flex-end;'>"
+                    f"<div class='msg-user'>{m.get('text')}</div>"
+                    "<img class='avatar' src='https://cdn-icons-png.flaticon.com/512/847/847969.png'>"
+                    "</div>"
+                )
             else:
-                emotion_image_slot.image(placeholder_image, width=200)
-        else:
-            # Expecting JSON like {"emotion": "happy", "scores": {...}} but we accept any dict
-            dominant = emo_res.get("emotion") if isinstance(emo_res, dict) and "emotion" in emo_res else None
-            # try common fields
-            if not dominant and isinstance(emo_res, dict):
-                # attempt to find max score key
-                scores = emo_res.get("scores") or {k: v for k, v in emo_res.items() if isinstance(v, (int, float))}
-                if isinstance(scores, dict) and scores:
-                    dominant = max(scores.items(), key=lambda kv: kv[1])[0]
-            emotion_label.markdown(f"**Emotion:** {dominant if dominant else 'unknown'}")
-            emotion_details.json(emo_res)
-            if snapshot:
-                emotion_image_slot.image(snapshot, width=200)
-else:
-    st.markdown("---")
-    render_session_summary(st.session_state["data_cache"])
+                html += (
+                    "<div class='msg-row'>"
+                    "<img class='avatar' src='https://cdn-icons-png.flaticon.com/512/4712/4712107.png'>"
+                    f"<div class='msg-assistant'>{m.get('text')}</div>"
+                    "</div>"
+                )
 
-# ----------------- Debug Panel -----------------
-with st.expander("Backend & Status", expanded=False):
-    st.write("Backend base URL:", BACKEND_BASE)
-    st.write("Streaming running:", st.session_state["running"])
-    st.write("Cached datapoints:", len(st.session_state["data_cache"]))
-    st.write("Drift Count:", st.session_state["drift_count"])
-    st.write("ML ready:", ml_ready)
+        # streaming in-progress (assistant)
+        if streaming_text:
+            html += (
+                "<div class='msg-row'>"
+                "<img class='avatar' src='https://cdn-icons-png.flaticon.com/512/4712/4712107.png'>"
+                f"<div class='msg-assistant typing'>{streaming_text}</div>"
+                "</div>"
+            )
+        elif typing_flag:
+            html += (
+                "<div class='msg-row'>"
+                "<img class='avatar' src='https://cdn-icons-png.flaticon.com/512/4712/4712107.png'>"
+                "<div class='msg-assistant typing'>Typing <span style='margin-left:8px;'>● ● ●</span></div>"
+                "</div>"
+            )
+
+        html += "</div>"
+        return html
+
+    chat_html = build_chat_html(
+        st.session_state["llm_messages"],
+        st.session_state.get("current_stream", ""),
+        st.session_state.get("typing", False),
+    )
+
+    chat_box = st.empty()
+    chat_box.markdown(chat_html, unsafe_allow_html=True)
+
+    # -------------------------
+    # Input row (safe clearing pattern)
+    # -------------------------
+    st.markdown("---")
+
+    # default value: clear if flag set, otherwise keep last
+    default_text = "" if st.session_state.get("chat_clear_flag", False) else st.session_state.get("chat_input_value", "")
+    # reset flag immediately (so widget renders with cleared value exactly once)
+    st.session_state["chat_clear_flag"] = False
+
+    user_input = st.text_input(
+        "Your message:",
+        key="chat_input_value",
+        value=default_text,
+        placeholder="Type your question and press Send..."
+    )
+
+    send_clicked = st.button("Send", key="chat_send_btn")
+
+    # -------------------------
+    # Worker (background) - NEVER call Streamlit inside this thread
+    # -------------------------
+    def chat_worker(prompt, q_obj):
+        # control tokens only, no streamlit ops
+        q_obj.put({"type": "typing_start"})
+        try:
+            r = requests.post(f"{LLM_BASE}/chat", json={"message": prompt}, timeout=30)
+            j = safe_json(r)
+            reply = j.get("reply") or j.get("summary") or j.get("result") or str(j)
+        except Exception as e:
+            reply = f"Error: {e}"
+
+        # stream reply in small chunks for nicer UX
+        # but do NOT append control tokens to history
+        chunk_size = 20
+        for i in range(0, len(reply), chunk_size):
+            q_obj.put({"type": "chunk", "text": reply[: i + chunk_size]})
+            # short sleep to emulate streaming; keep tiny to feel responsive
+            time.sleep(0.04)
+
+        # final token
+        q_obj.put({"type": "final", "text": reply})
+        q_obj.put({"type": "typing_end"})
+
+    # -------------------------
+    # When user sends
+    # -------------------------
+    if send_clicked and user_input and user_input.strip():
+        # add user bubble to UI immediately (main thread)
+        st.session_state["llm_messages"].append({
+            "ts": datetime.utcnow().strftime("%H:%M:%S"),
+            "text": user_input,
+            "source": "USER"
+        })
+
+        # local memory if enabled
+        if local_memory_mode:
+            st.session_state.setdefault("chat_memory", []).append({
+                "role": "user",
+                "text": user_input,
+                "ts": datetime.utcnow().isoformat()
+            })
+
+        # tell main thread to clear input on next render
+        st.session_state["chat_clear_flag"] = True
+
+        # start worker thread with local queue reference
+        threading.Thread(target=chat_worker, args=(user_input, local_queue), daemon=True).start()
+
+        # trigger a rerun so UI updates immediately (input clears and typing shows)
+        st.rerun()
+
+# ============================================================================================
+# DEBUG PANEL
+# ============================================================================================
+with st.expander("Debug Info"):
+    st.write("Backend:", BACKEND_BASE)
+    st.write("LLM:", LLM_BASE)
+    st.write("Running:", st.session_state["running"])
+    st.write("Datapoints:", len(st.session_state["data_cache"]))
+    st.write("LLM Messages:", st.session_state["llm_messages"][-10:])
     if ml_load_err:
-        st.write("ML load error (if any):")
         st.code(ml_load_err)
